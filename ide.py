@@ -29,7 +29,7 @@ APP_VERSION = "0.1.0"
 
 
 def required_runtime_packages() -> tuple[tuple[str, str], ...]:
-    packages = [("PySide6-Essentials>=6.7,<7", "PySide6")]
+    packages = [("PySide6-Essentials>=6.7,<7", "PySide6"), ("pyte>=0.8,<1", "pyte")]
     if os.name == "nt":
         packages.append(("pywinpty>=2,<4", "winpty"))
     return tuple(packages)
@@ -286,6 +286,43 @@ class GitFileStatus:
         return ", ".join(words) if words else "clean"
 
 
+@dataclasses.dataclass(frozen=True)
+class GitCommit:
+    full_hash: str
+    short_hash: str
+    author: str
+    when: str
+    subject: str
+
+
+@dataclasses.dataclass(frozen=True)
+class GitCommitFile:
+    status: str
+    path: str
+    old_path: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.old_path:
+            return f"{self.status}  {self.old_path} -> {self.path}"
+        return f"{self.status}  {self.path}"
+
+
+@dataclasses.dataclass(frozen=True)
+class GitSyncState:
+    branch: str
+    upstream: str | None
+    ahead: int
+    behind: int
+    diverged: bool
+    remote_is_ancestor: bool
+    local_is_ancestor: bool
+
+    @property
+    def has_upstream(self) -> bool:
+        return bool(self.upstream)
+
+
 def parse_porcelain_status(output: str) -> list[GitFileStatus]:
     statuses: list[GitFileStatus] = []
     for line in output.splitlines():
@@ -378,12 +415,103 @@ class GitService:
         value = result.stdout.strip()
         return value or None
 
+    def sync_state(self) -> GitSyncState:
+        branch = self.current_branch()
+        upstream = self.upstream()
+        if not upstream:
+            return GitSyncState(branch, None, 0, 0, False, False, False)
+        ahead = 0
+        behind = 0
+        counts = self.run("rev-list", "--left-right", "--count", f"{upstream}...HEAD", timeout=20)
+        if counts.ok:
+            parts = counts.stdout.strip().split()
+            if len(parts) >= 2:
+                behind = int(parts[0])
+                ahead = int(parts[1])
+        remote_ancestor = self.run("merge-base", "--is-ancestor", upstream, "HEAD", timeout=20).ok
+        local_ancestor = self.run("merge-base", "--is-ancestor", "HEAD", upstream, timeout=20).ok
+        diverged = not remote_ancestor and not local_ancestor
+        return GitSyncState(branch, upstream, ahead, behind, diverged, remote_ancestor, local_ancestor)
+
     def config_get(self, key: str) -> str:
         result = self.run("config", "--get", key, timeout=10)
         return result.stdout.strip() if result.ok else ""
 
     def config_set_local(self, key: str, value: str) -> CommandResult:
         return self.run("config", "--local", key, value, timeout=20)
+
+    def log_commits(self, limit: int = 80) -> list[GitCommit]:
+        result = self.run(
+            "log",
+            f"--max-count={limit}",
+            "--date=relative",
+            "--pretty=format:%H%x1f%h%x1f%an%x1f%cr%x1f%s%x1e",
+            timeout=30,
+        )
+        if not result.ok:
+            return []
+        commits: list[GitCommit] = []
+        for record in result.stdout.split("\x1e"):
+            record = record.strip()
+            if not record:
+                continue
+            parts = record.split("\x1f")
+            if len(parts) < 5:
+                continue
+            commits.append(GitCommit(parts[0], parts[1], parts[2], parts[3], parts[4]))
+        return commits
+
+    def commit_files(self, commit_hash: str) -> list[GitCommitFile]:
+        result = self.run("diff-tree", "--no-commit-id", "--name-status", "-r", "-M", commit_hash, timeout=30)
+        if not result.ok:
+            return []
+        files: list[GitCommitFile] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if not parts:
+                continue
+            status = parts[0]
+            if status.startswith("R") and len(parts) >= 3:
+                files.append(GitCommitFile(status, parts[2], parts[1]))
+            elif len(parts) >= 2:
+                files.append(GitCommitFile(status, parts[1]))
+        return files
+
+    def commit_patch(self, commit_hash: str, path: str | None = None) -> CommandResult:
+        args = ["show", "--format=fuller", "--stat", "--patch", "--find-renames", commit_hash]
+        if path:
+            args.extend(["--", path])
+        return self.run(*args, timeout=60)
+
+    def parent_commit(self, commit_hash: str) -> str | None:
+        result = self.run("rev-parse", f"{commit_hash}^", timeout=20)
+        if not result.ok:
+            return None
+        return result.stdout.strip() or None
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return self.run("merge-base", "--is-ancestor", ancestor, descendant, timeout=20).ok
+
+    def commit_is_pushed(self, commit_hash: str) -> bool:
+        upstream = self.upstream()
+        return bool(upstream and self.is_ancestor(commit_hash, upstream))
+
+    def squash_top_commits(self, commits_newest_first: list[str], message: str) -> CommandResult:
+        if not commits_newest_first:
+            return CommandResult(["git", "squash"], self._cwd(), 1, "", "No commits selected.")
+        base = self.parent_commit(commits_newest_first[-1])
+        if not base:
+            return CommandResult(
+                ["git", "squash"],
+                self._cwd(),
+                1,
+                "",
+                "Squashing the root commit is not supported in this lightweight flow.",
+            )
+        reset = self.run("reset", "--soft", base, timeout=60)
+        if not reset.ok:
+            return reset
+        return self.commit(message)
 
     def diff(self, path: str | None = None) -> CommandResult:
         args = ["diff"]
@@ -435,6 +563,12 @@ class GitService:
         if set_upstream and branch and branch != "-":
             return self.run("push", "-u", "origin", branch, timeout=600)
         return self.run("push", timeout=600)
+
+    def force_push_with_lease(self) -> CommandResult:
+        branch = self.current_branch()
+        if not branch or branch == "-":
+            return CommandResult(["git", "push", "--force-with-lease"], self._cwd(), 1, "", "No current branch.")
+        return self.run("push", "--force-with-lease", "origin", branch, timeout=600)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -819,6 +953,16 @@ class TerminalScreen:
         self.rows = max(5, rows)
         self.cols = max(20, cols)
         self.scrollback_limit = 800
+        self.pyte_screen: Any | None = None
+        self.pyte_stream: Any | None = None
+        try:
+            import pyte
+
+            self.pyte_screen = pyte.HistoryScreen(self.cols, self.rows, history=self.scrollback_limit)
+            self.pyte_stream = pyte.ByteStream(self.pyte_screen)
+        except Exception:
+            self.pyte_screen = None
+            self.pyte_stream = None
         self.scrollback: list[str] = []
         self.buffer: list[list[str]] = []
         self.cursor_row = 0
@@ -830,6 +974,9 @@ class TerminalScreen:
         self.reset()
 
     def reset(self) -> None:
+        if self.pyte_screen is not None:
+            self.pyte_screen.reset()
+            return
         self.buffer = [[" "] * self.cols for _ in range(self.rows)]
         self.cursor_row = 0
         self.cursor_col = 0
@@ -842,6 +989,11 @@ class TerminalScreen:
         rows = max(5, rows)
         cols = max(20, cols)
         if rows == self.rows and cols == self.cols:
+            return
+        if self.pyte_screen is not None:
+            self.rows = rows
+            self.cols = cols
+            self.pyte_screen.resize(lines=rows, columns=cols)
             return
         new_buffer = [[" "] * cols for _ in range(rows)]
         for r in range(min(rows, self.rows)):
@@ -858,10 +1010,30 @@ class TerminalScreen:
         return "".join(self.buffer[row]).rstrip()
 
     def render(self) -> str:
+        if self.pyte_screen is not None:
+            history = [
+                self.pyte_line_to_text(line).rstrip()
+                for line in getattr(self.pyte_screen.history, "top", [])
+            ]
+            display = [line.rstrip() for line in self.pyte_screen.display]
+            lines = [*history, *display]
+            while lines and not lines[-1]:
+                lines.pop()
+            return "\n".join(lines)
         lines = [*self.scrollback, *[self.line_text(row) for row in range(self.rows)]]
         while lines and not lines[-1]:
             lines.pop()
         return "\n".join(lines)
+
+    def pyte_line_to_text(self, line: Any) -> str:
+        if not line:
+            return ""
+        max_col = max(line.keys()) if hasattr(line, "keys") and line else -1
+        chars: list[str] = []
+        for col in range(max_col + 1):
+            char = line.get(col) if hasattr(line, "get") else None
+            chars.append(getattr(char, "data", " ") if char is not None else " ")
+        return "".join(chars)
 
     def scroll_up(self, count: int = 1) -> None:
         for _ in range(max(1, count)):
@@ -988,6 +1160,9 @@ class TerminalScreen:
 
     def process(self, text: str) -> None:
         text = text.replace("\u01b0m", "").replace("\u01b0", "")
+        if self.pyte_stream is not None:
+            self.pyte_stream.feed(text.encode("utf-8", errors="replace"))
+            return
         for ch in text:
             if self.state == "normal":
                 if ch == "\x1b":
@@ -1053,7 +1228,7 @@ class TerminalInput(QLineEdit):
         super().__init__()
         self.history: list[str] = []
         self.history_index = 0
-        self.setPlaceholderText("Command")
+        self.setPlaceholderText("Shell command")
         self.returnPressed.connect(self.on_return)
 
     def on_return(self) -> None:
@@ -1076,6 +1251,112 @@ class TerminalInput(QLineEdit):
         super().keyPressEvent(event)
 
 
+class TerminalView(QPlainTextEdit):
+    input_requested = Signal(str)
+    clear_requested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setReadOnly(True)
+        self.setFont(QFont("Consolas", 10))
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def selected_plain_text(self) -> str:
+        return self.textCursor().selectedText().replace("\u2029", "\n")
+
+    def copy_selection(self) -> bool:
+        text = self.selected_plain_text()
+        if not text:
+            return False
+        QApplication.clipboard().setText(text)
+        return True
+
+    def copy_all_text(self) -> None:
+        QApplication.clipboard().setText(self.toPlainText())
+
+    def keyPressEvent(self, event: Any) -> None:
+        key = event.key()
+        mods = event.modifiers()
+
+        if mods & Qt.KeyboardModifier.ControlModifier and mods & Qt.KeyboardModifier.ShiftModifier:
+            if key == Qt.Key.Key_C:
+                if not self.copy_selection():
+                    self.copy_all_text()
+                return
+            if key == Qt.Key.Key_V:
+                self.input_requested.emit(QApplication.clipboard().text())
+                return
+
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if key == Qt.Key.Key_C:
+                if self.copy_selection():
+                    return
+                self.input_requested.emit("\x03")
+                return
+            if key == Qt.Key.Key_L:
+                self.input_requested.emit("\x0c")
+                return
+            if key == Qt.Key.Key_D:
+                self.input_requested.emit("\x04")
+                return
+            if key == Qt.Key.Key_A:
+                self.input_requested.emit("\x01")
+                return
+            if key == Qt.Key.Key_E:
+                self.input_requested.emit("\x05")
+                return
+            if key == Qt.Key.Key_R:
+                self.input_requested.emit("\x12")
+                return
+            if key == Qt.Key.Key_V:
+                self.input_requested.emit(QApplication.clipboard().text())
+                return
+
+        mapping = {
+            Qt.Key.Key_Return: "\r\n",
+            Qt.Key.Key_Enter: "\r\n",
+            Qt.Key.Key_Backspace: "\x7f",
+            Qt.Key.Key_Tab: "\t",
+            Qt.Key.Key_Escape: "\x1b",
+            Qt.Key.Key_Up: "\x1b[A",
+            Qt.Key.Key_Down: "\x1b[B",
+            Qt.Key.Key_Right: "\x1b[C",
+            Qt.Key.Key_Left: "\x1b[D",
+            Qt.Key.Key_Home: "\x1b[H",
+            Qt.Key.Key_End: "\x1b[F",
+            Qt.Key.Key_Delete: "\x1b[3~",
+            Qt.Key.Key_PageUp: "\x1b[5~",
+            Qt.Key.Key_PageDown: "\x1b[6~",
+        }
+        if key in mapping:
+            self.input_requested.emit(mapping[key])
+            return
+
+        text = event.text()
+        if text:
+            self.input_requested.emit(text)
+            return
+
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event: Any) -> None:
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        copy_all_action = menu.addAction("Copy All")
+        paste_action = menu.addAction("Paste")
+        clear_action = menu.addAction("Clear")
+        action = menu.exec(event.globalPos())
+        if action == copy_action:
+            self.copy_selection()
+        elif action == copy_all_action:
+            self.copy_all_text()
+        elif action == paste_action:
+            self.input_requested.emit(QApplication.clipboard().text())
+        elif action == clear_action:
+            self.clear_requested.emit()
+
+
 class TerminalPanel(QWidget):
     process_finished = Signal()
 
@@ -1089,29 +1370,28 @@ class TerminalPanel(QWidget):
         self.reader_thread: threading.Thread | None = None
         self.use_pty = self.load_pty_backend()
 
-        self.output = QPlainTextEdit()
-        self.output.setReadOnly(True)
-        self.output.setFont(QFont("Consolas", 10))
-        self.output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.output = TerminalView()
+        self.output.input_requested.connect(self.write_to_shell)
+        self.output.clear_requested.connect(self.clear_terminal)
         self.screen = TerminalScreen(*self.terminal_dimensions())
-
-        self.input = TerminalInput()
-        self.input.submit.connect(self.submit)
 
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self.stop)
-        self.restart_button = QPushButton("Restart")
+        self.restart_button = QPushButton("Reset Shell")
         self.restart_button.clicked.connect(self.restart_shell)
         self.external_button = QPushButton("OS Terminal")
         self.external_button.clicked.connect(self.open_external_terminal)
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.clicked.connect(self.copy_terminal)
         self.clear_button = QPushButton("Clear")
-        self.clear_button.clicked.connect(self.output.clear)
+        self.clear_button.clicked.connect(self.clear_terminal)
 
         row = QHBoxLayout()
-        row.addWidget(self.input, 1)
+        row.addStretch(1)
         row.addWidget(self.stop_button)
         row.addWidget(self.restart_button)
         row.addWidget(self.external_button)
+        row.addWidget(self.copy_button)
         row.addWidget(self.clear_button)
 
         layout = QVBoxLayout(self)
@@ -1122,6 +1402,7 @@ class TerminalPanel(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain_output_queue)
         self.timer.start(30)
+        self.output.setFocus()
 
     def set_workspace(self, path: Path | None) -> None:
         self.workspace = path
@@ -1160,7 +1441,7 @@ class TerminalPanel(QWidget):
                     "-NoProfile",
                     "-NoExit",
                     "-Command",
-                    "try { Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue } catch {}",
+                    "Remove-Module PSReadLine -ErrorAction SilentlyContinue",
                 ]
             return [powershell, "-NoLogo", "-NoProfile"]
         return [os.environ.get("SHELL", "/bin/sh")]
@@ -1198,6 +1479,7 @@ class TerminalPanel(QWidget):
     def restart_shell(self) -> None:
         self.append_raw("\n[restarting terminal]\n")
         self.start_shell()
+        self.output.setFocus()
 
     def shutdown_shell(self) -> None:
         self.reader_stop.set()
@@ -1288,6 +1570,14 @@ class TerminalPanel(QWidget):
     def submit(self, text: str) -> None:
         self.write_to_shell(text + "\r\n")
 
+    def clear_terminal(self) -> None:
+        self.screen.reset()
+        self.render_screen()
+
+    def copy_terminal(self) -> None:
+        if not self.output.copy_selection():
+            self.output.copy_all_text()
+
     def stop(self) -> None:
         process = self.pty_process
         if process is None:
@@ -1300,19 +1590,28 @@ class TerminalPanel(QWidget):
             except Exception:
                 pass
 
-    def open_external_terminal(self) -> None:
+    def open_external_terminal(self, command: str | None = None) -> None:
         cwd = self.workspace if self.workspace and self.workspace.exists() else Path.cwd()
         if os.name == "nt":
             wt = shutil.which("wt.exe")
             if wt:
-                subprocess.Popen([wt, "-d", str(cwd)], shell=False)
+                args = [wt, "-d", str(cwd)]
+                if command:
+                    args.extend(["powershell.exe", "-NoLogo", "-NoExit", "-Command", command])
+                subprocess.Popen(args, shell=False)
                 return
             powershell = shutil.which("powershell.exe") or "powershell.exe"
-            subprocess.Popen([powershell, "-NoLogo", "-NoExit", "-Command", self.cd_command(cwd)], shell=False)
+            args = [powershell, "-NoLogo", "-NoExit"]
+            if command:
+                args.extend(["-Command", command])
+            subprocess.Popen(args, shell=False, cwd=str(cwd))
             return
         terminal = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("konsole")
         if terminal:
-            subprocess.Popen([terminal], cwd=str(cwd))
+            if command:
+                subprocess.Popen([terminal, "-e", command], cwd=str(cwd))
+            else:
+                subprocess.Popen([terminal], cwd=str(cwd))
 
     def resizeEvent(self, event: Any) -> None:
         super().resizeEvent(event)
@@ -1340,6 +1639,7 @@ class GitPanel(QWidget):
         self.service = GitService()
         self.workspace: Path | None = None
         self.save_all_callback: Any = lambda: True
+        self.history_rewrite_pending = False
 
         self.repo_label = QLabel("No workspace")
         self.branch_label = QLabel("Branch: -")
@@ -1390,7 +1690,32 @@ class GitPanel(QWidget):
         self.pull_button = QPushButton("Pull")
         self.pull_button.clicked.connect(lambda: self.run_in_terminal("git pull"))
         self.push_button = QPushButton("Push")
-        self.push_button.clicked.connect(lambda: self.run_in_terminal("git push"))
+        self.push_button.clicked.connect(self.push_now)
+        self.force_push_button = QPushButton("Force Push Safely")
+        self.force_push_button.clicked.connect(self.force_push_safely)
+
+        self.history_table = QTableWidget(0, 4)
+        self.history_table.setHorizontalHeaderLabels(["Commit", "Message", "Author", "When"])
+        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.history_table.currentItemChanged.connect(self.update_commit_detail)
+        self.history_table.itemSelectionChanged.connect(self.update_history_action_state)
+
+        self.commit_files = QListWidget()
+        self.commit_files.currentItemChanged.connect(self.update_commit_file_diff)
+
+        self.squash_button = QPushButton("Squash Selected")
+        self.squash_button.clicked.connect(self.squash_selected_commits)
+        self.squash_button.setEnabled(False)
+
+        self.commit_diff_view = QPlainTextEdit()
+        self.commit_diff_view.setReadOnly(True)
+        self.commit_diff_view.setFont(QFont("Consolas", 10))
+        self.commit_diff_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
         top = QHBoxLayout()
         top.addWidget(self.refresh_button)
@@ -1425,24 +1750,53 @@ class GitPanel(QWidget):
         branch_row.addWidget(self.new_branch_button)
 
         remote_row = QHBoxLayout()
-        remote_row.addWidget(self.fetch_button)
-        remote_row.addWidget(self.pull_button)
+        remote_row.addWidget(QLabel("Sync"))
         remote_row.addWidget(self.push_button)
+        remote_row.addWidget(self.force_push_button)
+        remote_row.addStretch(1)
+
+        changes_tab = QWidget()
+        changes_layout = QVBoxLayout(changes_tab)
+        changes_layout.setContentsMargins(0, 0, 0, 0)
+        changes_layout.addWidget(QLabel("Changed files (included automatically)"))
+        changes_layout.addWidget(self.files, 1)
+        changes_layout.addWidget(QLabel("Diff"))
+        changes_layout.addWidget(self.diff_view, 2)
+        changes_layout.addLayout(commit_row)
+
+        history_actions = QHBoxLayout()
+        history_actions.addWidget(self.squash_button)
+        history_actions.addStretch(1)
+
+        history_splitter = QSplitter(Qt.Orientation.Vertical)
+        history_top = QWidget()
+        history_top_layout = QVBoxLayout(history_top)
+        history_top_layout.setContentsMargins(0, 0, 0, 0)
+        history_top_layout.addWidget(self.history_table, 2)
+        history_top_layout.addWidget(QLabel("Files in selected commit"))
+        history_top_layout.addWidget(self.commit_files, 1)
+        history_top_layout.addLayout(history_actions)
+        history_splitter.addWidget(history_top)
+        history_splitter.addWidget(self.commit_diff_view)
+        history_splitter.setSizes([360, 420])
+
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.addWidget(history_splitter)
+
+        self.git_tabs = QTabWidget()
+        self.git_tabs.addTab(changes_tab, "Changes")
+        self.git_tabs.addTab(history_tab, "History")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.addLayout(top)
         layout.addWidget(simple_box)
+        layout.addLayout(remote_row)
         layout.addWidget(self.repo_label)
         layout.addWidget(self.branch_label)
-        layout.addWidget(QLabel("Changed files (included automatically)"))
-        layout.addWidget(self.files, 1)
-        layout.addLayout(action_row)
-        layout.addWidget(QLabel("Diff"))
-        layout.addWidget(self.diff_view, 2)
-        layout.addLayout(commit_row)
-        layout.addLayout(branch_row)
-        layout.addLayout(remote_row)
+        layout.addWidget(self.git_tabs, 1)
 
     def set_workspace(self, path: Path | None) -> None:
         self.workspace = path
@@ -1535,11 +1889,15 @@ class GitPanel(QWidget):
             self.simple_status.setText("Git is not installed or not available in PATH.")
             self.primary_git_button.setText("Git Missing")
             self.primary_git_button.setEnabled(False)
+            self.push_button.setEnabled(False)
+            self.force_push_button.setEnabled(False)
             return
         if not self.workspace:
             self.simple_status.setText("Open a folder to use Git.")
             self.primary_git_button.setText("Open Workspace First")
             self.primary_git_button.setEnabled(False)
+            self.push_button.setEnabled(False)
+            self.force_push_button.setEnabled(False)
             return
         self.primary_git_button.setEnabled(True)
         if not self.service.is_repo():
@@ -1548,6 +1906,8 @@ class GitPanel(QWidget):
                 "create a private GitHub repo, add origin, and push."
             )
             self.primary_git_button.setText("Make Private GitHub Repo")
+            self.push_button.setEnabled(False)
+            self.force_push_button.setEnabled(False)
             return
         if not self.service.has_remote("origin"):
             self.simple_status.setText(
@@ -1555,11 +1915,24 @@ class GitPanel(QWidget):
                 "and publish it as a private GitHub repo."
             )
             self.primary_git_button.setText("Publish To GitHub")
+            self.push_button.setEnabled(False)
+            self.force_push_button.setEnabled(False)
+            return
+        state = self.service.sync_state()
+        self.push_button.setEnabled(True)
+        self.force_push_button.setEnabled(True)
+        if self.history_rewrite_pending or (state.diverged and state.ahead > 0):
+            self.simple_status.setText(
+                "Local history differs from GitHub. Review History, then update GitHub safely with force-with-lease."
+            )
+            self.primary_git_button.setText("Force Push Safely")
             return
         if self.service.has_changes():
             self.simple_status.setText("Changes found. Commit All + Sync will include every changed file automatically.")
         else:
-            self.simple_status.setText("Repo is clean. Commit All + Sync will just pull/push with origin.")
+            self.simple_status.setText(
+                f"Repo is clean. Sync: ahead {state.ahead}, behind {state.behind}."
+            )
         self.primary_git_button.setText("Commit All + Sync")
 
     def ensure_repo(self) -> bool:
@@ -1574,6 +1947,9 @@ class GitPanel(QWidget):
             self.branch_label.setText("Branch: -")
             self.files.clear()
             self.diff_view.clear()
+            self.history_table.setRowCount(0)
+            self.commit_files.clear()
+            self.commit_diff_view.clear()
             self.branch_combo.clear()
             return False
         return True
@@ -1593,6 +1969,7 @@ class GitPanel(QWidget):
             self.files.addItem(item)
         if self.files.count() == 0:
             self.diff_view.setPlainText("No changes.")
+        self.refresh_history()
         self.branch_combo.blockSignals(True)
         self.branch_combo.clear()
         self.branch_combo.addItems(self.service.branches())
@@ -1601,6 +1978,201 @@ class GitPanel(QWidget):
         if index >= 0:
             self.branch_combo.setCurrentIndex(index)
         self.branch_combo.blockSignals(False)
+
+    def refresh_history(self) -> None:
+        current_hash = self.selected_commit().full_hash if self.selected_commit() else ""
+        self.history_table.blockSignals(True)
+        self.history_table.setRowCount(0)
+        for commit in self.service.log_commits(limit=120):
+            row = self.history_table.rowCount()
+            self.history_table.insertRow(row)
+            hash_item = QTableWidgetItem(commit.short_hash)
+            hash_item.setData(Qt.ItemDataRole.UserRole, commit)
+            self.history_table.setItem(row, 0, hash_item)
+            self.history_table.setItem(row, 1, QTableWidgetItem(commit.subject))
+            self.history_table.setItem(row, 2, QTableWidgetItem(commit.author))
+            self.history_table.setItem(row, 3, QTableWidgetItem(commit.when))
+            if commit.full_hash == current_hash:
+                self.history_table.selectRow(row)
+        self.history_table.blockSignals(False)
+        if self.history_table.rowCount() and self.history_table.currentRow() < 0:
+            self.history_table.setCurrentCell(0, 0)
+        self.update_commit_detail()
+        self.update_history_action_state()
+
+    def selected_commit(self) -> GitCommit | None:
+        row = self.history_table.currentRow()
+        if row < 0:
+            return None
+        item = self.history_table.item(row, 0)
+        if not item:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return value if isinstance(value, GitCommit) else None
+
+    def selected_history_rows(self) -> list[int]:
+        rows = sorted({index.row() for index in self.history_table.selectedIndexes()})
+        return [row for row in rows if row >= 0]
+
+    def selected_commits_newest_first(self) -> list[GitCommit]:
+        commits: list[GitCommit] = []
+        for row in self.selected_history_rows():
+            item = self.history_table.item(row, 0)
+            if not item:
+                continue
+            value = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(value, GitCommit):
+                commits.append(value)
+        return commits
+
+    def top_contiguous_selection(self) -> bool:
+        rows = self.selected_history_rows()
+        return bool(rows) and rows == list(range(0, max(rows) + 1))
+
+    def update_history_action_state(self) -> None:
+        commits = self.selected_commits_newest_first()
+        self.squash_button.setEnabled(len(commits) >= 2 and self.top_contiguous_selection())
+
+    def selected_commit_file(self) -> GitCommitFile | None:
+        item = self.commit_files.currentItem()
+        if not item:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return value if isinstance(value, GitCommitFile) else None
+
+    def update_commit_detail(self, *_: Any) -> None:
+        commit = self.selected_commit()
+        self.commit_files.clear()
+        self.commit_diff_view.clear()
+        if not commit:
+            return
+        for changed in self.service.commit_files(commit.full_hash):
+            item = QListWidgetItem(changed.label)
+            item.setData(Qt.ItemDataRole.UserRole, changed)
+            self.commit_files.addItem(item)
+        patch = self.service.commit_patch(commit.full_hash)
+        self.commit_diff_view.setPlainText(patch.stdout if patch.ok else patch.combined_output)
+
+    def update_commit_file_diff(self, *_: Any) -> None:
+        commit = self.selected_commit()
+        changed = self.selected_commit_file()
+        if not commit or not changed:
+            return
+        patch = self.service.commit_patch(commit.full_hash, changed.path)
+        self.commit_diff_view.setPlainText(patch.stdout if patch.ok else patch.combined_output)
+
+    def squash_selected_commits(self) -> None:
+        if not self.ensure_repo():
+            return
+        if not self.save_open_files():
+            return
+        commits = self.selected_commits_newest_first()
+        if len(commits) < 2:
+            QMessageBox.warning(self, APP_NAME, "Select at least two commits from the top of History.")
+            return
+        if not self.top_contiguous_selection():
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "For a safe lightweight squash, select a continuous range starting from the newest commit.",
+            )
+            return
+        if self.service.has_changes():
+            QMessageBox.warning(self, APP_NAME, "Commit or discard current changes before squashing history.")
+            return
+        pushed = any(self.service.commit_is_pushed(commit.full_hash) for commit in commits)
+        summary = "\n".join(f"{commit.short_hash}  {commit.subject}" for commit in commits)
+        if pushed:
+            answer = QMessageBox.warning(
+                self,
+                "Rewrite Published History",
+                "Some selected commits already exist on GitHub.\n\n"
+                "Squash will rewrite local history. After that, normal push will fail and the next safe action "
+                "will be force-with-lease.\n\n"
+                f"Selected commits:\n{summary}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        default_message = commits[-1].subject if commits else "Squashed commit"
+        message, ok = QInputDialog.getMultiLineText(
+            self,
+            "Squash Commits",
+            "New commit message:",
+            default_message,
+        )
+        if not ok or not message.strip():
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = self.service.squash_top_commits([commit.full_hash for commit in commits], message.strip())
+        finally:
+            QApplication.restoreOverrideCursor()
+        if result.ok:
+            self.history_rewrite_pending = pushed
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "Squash complete."
+                + ("\n\nUse Force Push Safely to update GitHub." if pushed else ""),
+            )
+        else:
+            QMessageBox.warning(self, APP_NAME, result.combined_output)
+        self.refresh()
+
+    def force_push_safely(self) -> None:
+        if not self.ensure_repo():
+            return
+        state = self.service.sync_state()
+        branch = state.branch
+        if not branch or branch == "-":
+            QMessageBox.warning(self, APP_NAME, "No current branch to push.")
+            return
+        typed, ok = QInputDialog.getText(
+            self,
+            "Force Push Safely",
+            f"Type branch name to confirm force-with-lease:\n\n{branch}",
+        )
+        if not ok or typed.strip() != branch:
+            return
+        message = (
+            f"This will run:\n\n"
+            f"git push --force-with-lease origin {branch}\n\n"
+            f"Upstream: {state.upstream or 'none'}\n"
+            f"Ahead: {state.ahead}, behind: {state.behind}\n\n"
+            "It is safer than --force because Git refuses if GitHub moved unexpectedly."
+        )
+        answer = QMessageBox.warning(
+            self,
+            "Force Push Safely",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = self.service.force_push_with_lease()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.show_result(result, "GitHub updated.")
+        if result.ok:
+            self.history_rewrite_pending = False
+        self.refresh()
+
+    def push_now(self) -> None:
+        if not self.ensure_repo():
+            return
+        state = self.service.sync_state()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = self.service.push_current(set_upstream=not state.has_upstream)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.show_result(result, "Pushed.")
+        self.refresh()
 
     def show_result(self, result: CommandResult, success_title: str = "Done") -> None:
         text = result.combined_output or success_title
@@ -1620,6 +2192,9 @@ class GitPanel(QWidget):
 
     def primary_git_action(self) -> None:
         if not self.workspace:
+            return
+        if self.primary_git_button.text() == "Force Push Safely":
+            self.force_push_safely()
             return
         if not self.service.is_repo() or not self.service.has_remote("origin"):
             self.make_private_github_repo()
@@ -2421,6 +2996,12 @@ def run_self_test() -> int:
     assert parsed[1].is_staged
     assert parsed[2].is_untracked
     assert parsed[3].old_path == "old.py"
+    screen = TerminalScreen(rows=5, cols=30)
+    screen.process("\x1b]0;ide\x07PS> test\rPS> ok\nhello")
+    rendered = screen.render()
+    assert "0;ide" not in rendered, rendered
+    assert "PS> ok" in rendered, rendered
+    assert "hello" in rendered, rendered
     print(f"{APP_NAME} self-test ok")
     print(f"Python: {sys.executable}")
     print(f"Platform: {platform.platform()}")
